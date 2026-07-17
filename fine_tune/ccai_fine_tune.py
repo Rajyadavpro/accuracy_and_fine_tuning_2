@@ -1,6 +1,20 @@
 import json
 import logging
 import os
+
+# Add ffmpeg directory to PATH BEFORE importing pydub
+# This ensures pydub can find ffmpeg and ffprobe automatically
+_ffmpeg_bin_paths = [
+    r"C:\Users\raj.kumaryadav\ffmpeg\bin",
+    r"C:\Program Files\ffmpeg\bin",
+    r"C:\Program Files (x86)\ffmpeg\bin",
+]
+
+for bin_path in _ffmpeg_bin_paths:
+    if os.path.isdir(bin_path):
+        os.environ['PATH'] = bin_path + os.pathsep + os.environ.get('PATH', '')
+        break
+
 from pydub import AudioSegment
 from azure.storage.blob import BlobServiceClient
 
@@ -49,12 +63,32 @@ def process_finetuning_ccai(payload: dict):
         logging.error("[f2 CCAI FineTuning] Payload missing required fields: 'container' and/or 'blob_names'.")
         return
 
-    blob_path = blob_names[0]
-    folder_prefix = blob_path.split("/")[0]  # e.g., 00077591-0030-4fa3-aa18-924802d05403
+    # 3. Process each blob_name (folder_prefix) in the array
+    for blob_name in blob_names:
+        folder_prefix = blob_name.split("/")[0] if "/" in blob_name else blob_name
+        logging.info(f"[f2 CCAI FineTuning] Processing blob_name: {blob_name} (folder: {folder_prefix})")
+        _process_single_blob(
+            source_container_name=source_container_name,
+            folder_prefix=folder_prefix,
+            ccai_conn_string=ccai_conn_string,
+            azure_conn_string=azure_conn_string,
+            target_container_name=target_container_name
+        )
 
-    logging.info(f"[f2 CCAI FineTuning] Source: {source_container_name}/{folder_prefix}")
+    logging.info(f"[f2 CCAI FineTuning] All {len(blob_names)} items processed.")
 
-    # 3. Set up blob clients
+
+def _process_single_blob(
+    source_container_name: str,
+    folder_prefix: str,
+    ccai_conn_string: str,
+    azure_conn_string: str,
+    target_container_name: str
+) -> None:
+    """Process a single blob folder (folder_prefix)."""
+    logging.info(f"[f2 CCAI FineTuning] Processing folder: {source_container_name}/{folder_prefix}")
+
+    # Set up blob clients
     source_container_client = BlobServiceClient.from_connection_string(ccai_conn_string) \
         .get_container_client(source_container_name)
     target_container_client = BlobServiceClient.from_connection_string(azure_conn_string) \
@@ -66,21 +100,21 @@ def process_finetuning_ccai(payload: dict):
 
     # Use /tmp for ephemeral local storage (safe in Azure Functions)
     tmp_dir = os.getenv("TEMP", "/tmp")
-    original_transcript_path = os.path.join(tmp_dir, "call_transcript.json")
-    original_audio_path = os.path.join(tmp_dir, "call_recording.ogg")
-    modified_json_path = os.path.join(tmp_dir, "modified_json.json")
+    original_transcript_path = os.path.join(tmp_dir, f"{folder_prefix}_transcript.json")
+    original_audio_path = os.path.join(tmp_dir, f"{folder_prefix}_recording.ogg")
+    modified_json_path = os.path.join(tmp_dir, f"{folder_prefix}_modified.json")
     clipped_files = []
 
     try:
-        # 4. Download source files
-        logging.info("[f2 CCAI FineTuning] Downloading transcript and audio...")
+        # Download source files
+        logging.info(f"[f2 CCAI FineTuning] Downloading transcript and audio for {folder_prefix}...")
         with open(original_transcript_path, "wb") as f:
             f.write(source_container_client.download_blob(f"{folder_prefix}/call_transcript.json").readall())
 
         with open(original_audio_path, "wb") as f:
             f.write(source_container_client.download_blob(f"{folder_prefix}/call_recording.ogg").readall())
 
-        # 5. Load audio and transcript
+        # Load audio and transcript
         audio = AudioSegment.from_ogg(original_audio_path)
         total_audio_ms = len(audio)
 
@@ -89,12 +123,12 @@ def process_finetuning_ccai(payload: dict):
 
         turns = transcript_data.get("turns", [])
         if not turns:
-            logging.warning("[f2 CCAI FineTuning] Transcript has no turns. Nothing to process.")
+            logging.warning(f"[f2 CCAI FineTuning] Transcript for {folder_prefix} has no turns. Skipping.")
             return
 
         modified_turns = []
 
-        # 6. Clip audio per turn and build modified transcript
+        # Clip audio per turn and build modified transcript
         for i, current_turn in enumerate(turns):
             role = current_turn["role"]
             text = current_turn["text"]
@@ -109,7 +143,7 @@ def process_finetuning_ccai(payload: dict):
                 end_time_str = _ms_to_time(end_ms)
 
             clip_name = f"{role}_{i + 1}"
-            clip_filename = os.path.join(tmp_dir, f"{clip_name}.ogg")
+            clip_filename = os.path.join(tmp_dir, f"{folder_prefix}_{clip_name}.ogg")
 
             modified_turns.append({
                 "role": role,
@@ -127,7 +161,7 @@ def process_finetuning_ccai(payload: dict):
         with open(modified_json_path, "w", encoding="utf-8") as f:
             json.dump({"turns": modified_turns}, f, indent=4)
 
-        # 7. Upload all files to target container
+        # Upload all files to target container
         files_to_upload = [
             (original_transcript_path, "call_transcript.json"),
             (original_audio_path, "call_recording.ogg"),
@@ -139,19 +173,18 @@ def process_finetuning_ccai(payload: dict):
             blob_client = target_container_client.get_blob_client(f"{folder_prefix}/{blob_name}")
             with open(local_path, "rb") as data:
                 blob_client.upload_blob(data, overwrite=True)
-            logging.info(f"[f2 CCAI FineTuning] Uploaded: {blob_name}")
+            logging.info(f"[f2 CCAI FineTuning] Uploaded: {folder_prefix}/{blob_name}")
 
-        logging.info("[f2 CCAI FineTuning] Completed successfully.")
+        logging.info(f"[f2 CCAI FineTuning] Completed for {folder_prefix}.")
 
     except Exception as e:
         logging.error(f"[f2 CCAI FineTuning] Processing failed for {folder_prefix}: {e}", exc_info=True)
 
     finally:
-        # 8. Clean up all temp files
-        for local_path, _ in [
-            (original_transcript_path, None),
-            (original_audio_path, None),
-            (modified_json_path, None),
-        ] + [(p, None) for p in clipped_files]:
-            if os.path.exists(local_path):
-                os.remove(local_path)
+        # Clean up all temp files for this folder
+        for fpath in [original_transcript_path, original_audio_path, modified_json_path] + clipped_files:
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception as cleanup_err:
+                    logging.warning(f"[f2 CCAI FineTuning] Failed to cleanup {fpath}: {cleanup_err}")

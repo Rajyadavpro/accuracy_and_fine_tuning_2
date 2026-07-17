@@ -4,21 +4,6 @@ import json
 import os
 from pathlib import Path
 
-# Import accuracy processors
-from accuracy.idp_accuracy import process_accuracy_idp
-# from accuracy.tabak_accuracy import process_accuracy_tabak
-from accuracy.healthcare_accuracy import (
-    process_accuracy_healthcare_eob,
-    process_accuracy_healthcare_superbill
-)
-
-# Import finetune processors
-from fine_tune.idp_finetune import process_finetuning_idp
-from fine_tune.tabak_finetune import process_finetuning_tabak
-from fine_tune.eob_fine_tune import process_finetuning_healthcare_eob
-from fine_tune.superbill_finetune import process_finetuning_healthcare_superbill
-from fine_tune.ccai_fine_tune import process_finetuning_ccai
-
 app = func.FunctionApp()
 
 
@@ -42,26 +27,35 @@ def route_fetched_message(payload: dict):
 
     if pt_normalized == "accuracy":
         if src_normalized == "idp":
+            from accuracy.idp_accuracy import process_accuracy_idp
             process_accuracy_idp(payload)
         elif src_normalized == "tabak":
+            from accuracy.tabak_accuracy import process_accuracy_tabak
             process_accuracy_tabak(payload)
         elif src_normalized in ("healthcare_eob", "healthcare_accuracy_eob", "eob"):
+            from accuracy.healthcare_accuracy import process_accuracy_healthcare_eob
             process_accuracy_healthcare_eob(payload)
         elif src_normalized in ("healthcare_superbill", "healthcare_accuracy_superbill", "superbill"):
+            from accuracy.healthcare_accuracy import process_accuracy_healthcare_superbill
             process_accuracy_healthcare_superbill(payload)
         else:
             logging.warning(f"[f2 Router] Unhandled Accuracy source: '{source}'")
 
     elif pt_normalized == "finetuning":
         if src_normalized == "idp":
+            from fine_tune.idp_finetune import process_finetuning_idp
             process_finetuning_idp(payload)
         elif src_normalized == "tabak":
+            from fine_tune.tabak_finetune import process_finetuning_tabak
             process_finetuning_tabak(payload)
         elif src_normalized in ("healthcare_eob", "eob"):
+            from fine_tune.eob_fine_tune import process_finetuning_healthcare_eob
             process_finetuning_healthcare_eob(payload)
         elif src_normalized in ("healthcare_superbill", "superbill"):
+            from fine_tune.superbill_finetune import process_finetuning_healthcare_superbill
             process_finetuning_healthcare_superbill(payload)
         elif src_normalized == "ccai":
+            from fine_tune.ccai_fine_tune import process_finetuning_ccai
             process_finetuning_ccai(payload)
         else:
             logging.warning(f"[f2 Router] Unhandled FineTuning source: '{source}'")
@@ -86,12 +80,10 @@ def main_queue_worker_trigger(msg: func.ServiceBusMessage) -> None:
     # If USE_QUEUE toggle is off, skip processing from queue
     if os.getenv("USE_QUEUE", "true").strip().lower() != "true":
         logging.info("f2 Queue Trigger: USE_QUEUE=false — skipping queue message, folder mode is active.")
-        msg.abandon()
         return
 
     logging.info("f2 Queue Trigger activated. Parsing message payload...")
     delete_after_processing = os.getenv("DELETE_MSG_AFTER_PROCESSING", "true").strip().lower() == "true"
-    processed_successfully = False
     try:
         body_str = msg.get_body().decode('utf-8')
         data = json.loads(body_str)
@@ -103,23 +95,17 @@ def main_queue_worker_trigger(msg: func.ServiceBusMessage) -> None:
             payload = data
 
         route_fetched_message(payload)
-        processed_successfully = True
+        if delete_after_processing:
+            logging.info("f2 Queue Trigger: Processing succeeded. Runtime will auto-complete message.")
+        else:
+            logging.info("f2 Queue Trigger: DELETE_MSG_AFTER_PROCESSING=false is not supported with this trigger type; runtime auto-complete remains active.")
 
     except json.JSONDecodeError:
         logging.error("f2 Trigger failed: Message content was not valid JSON.")
+        raise
     except Exception as e:
         logging.error(f"f2 Trigger encountered an execution error: {e}", exc_info=True)
-    finally:
-        if delete_after_processing and processed_successfully:
-            msg.complete()
-            logging.info("f2 Queue Trigger: Message completed (deleted) from queue.")
-        elif not delete_after_processing:
-            msg.abandon()
-            logging.info("f2 Queue Trigger: DELETE_MSG_AFTER_PROCESSING=false — message abandoned back to queue.")
-        else:
-            # Processing failed — abandon so it can be retried or dead-lettered
-            msg.abandon()
-            logging.warning("f2 Queue Trigger: Processing failed — message abandoned for retry.")
+        raise
 
 
 # =====================================================================

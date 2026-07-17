@@ -1,8 +1,28 @@
 import os
+import json
 import logging
 import requests
 from langfuse import Langfuse
-from fine_tune.gcp_helper import upload_bytes_to_gcs
+
+# Import Azure Blob Storage libraries
+from azure.storage.blob import BlobServiceClient, ContentSettings
+
+def get_azure_setting(key: str, default=None):
+    """
+    Helper function to load variables from local.settings.json (local dev)
+    or from Environment Variables (when deployed to Azure).
+    """
+    try:
+        if os.path.exists("local.settings.json"):
+            with open("local.settings.json", "r") as f:
+                settings = json.load(f)
+                if "Values" in settings and key in settings["Values"]:
+                    return settings["Values"][key]
+    except Exception as e:
+        logging.warning(f"[f2 Tabak FineTuning] Could not read local.settings.json: {e}")
+    
+    # Fallback to environment variables for Azure deployment
+    return os.getenv(key, default)
 
 def process_finetuning_tabak(payload: dict):
     logging.info("[f2 Tabak FineTuning] Processing payload...")
@@ -15,11 +35,20 @@ def process_finetuning_tabak(payload: dict):
         logging.warning("[f2 Tabak FineTuning] No records to process.")
         return
 
-    bucket_name = os.getenv("GCP_FINE_TUNING_BUCKET_NAME")
-    if not bucket_name:
-        logging.warning("[f2 Tabak FineTuning] GCP_FINE_TUNING_BUCKET_NAME not set. GCS uploads skipped.")
+    # Load Azure configurations
+    container_name = get_azure_setting("FINAL_DATA_TABAK_CONTAINER", "tabak-dataset")
+    connection_string = get_azure_setting("AzureWebJobsStorage") # standard key for Azure Storage Connection string
 
-    tabak_url_prefix = os.getenv("TABAK_BLOB_URL_PREFIX", "https://tabakprod.blob.core.windows.net/processed-files/").strip()
+    blob_service_client = None
+    if connection_string:
+        try:
+            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        except Exception as e:
+            logging.error(f"[f2 Tabak FineTuning] Failed to initialize BlobServiceClient: {e}")
+    else:
+        logging.warning("[f2 Tabak FineTuning] Connection string missing. Azure Blob uploads will be skipped.")
+
+    tabak_url_prefix = get_azure_setting("TABAK_BLOB_URL_PREFIX", "https://tabakprod.blob.core.windows.net/processed-files/").strip()
 
     try:
         langfuse = Langfuse()
@@ -46,24 +75,30 @@ def process_finetuning_tabak(payload: dict):
         # Structure pattern: tabak/{category}/{subcategory}/{filename}
         destination_path = f"tabak/{category_clean}/{subcategory_clean}/{file_name}"
 
-        # Download PDF from remote blob endpoint
-        if bucket_name:
+        # Download PDF from remote blob endpoint and upload to the Tabak finetuning container
+        if blob_service_client and container_name:
             file_url = f"{tabak_url_prefix.rstrip('/')}/{file_name}"
             try:
                 logging.info(f"[f2 Tabak FineTuning] Downloading PDF: {file_url}")
                 res = requests.get(file_url, timeout=30)
                 if res.status_code == 200:
                     pdf_bytes = res.content
-                    upload_bytes_to_gcs(
-                        bucket_name=bucket_name,
-                        destination_blob_name=destination_path,
-                        data=pdf_bytes,
-                        content_type="application/pdf"
+                    
+                    blob_client = blob_service_client.get_blob_client(container=container_name, blob=destination_path)
+                    pdf_content_settings = ContentSettings(content_type="application/pdf")
+                    blob_client.upload_blob(
+                        pdf_bytes, 
+                        overwrite=True, 
+                        content_settings=pdf_content_settings
                     )
                 else:
                     logging.error(f"[f2 Tabak FineTuning] Download failed with status: {res.status_code}")
             except Exception as dl_err:
                 logging.error(f"[f2 Tabak FineTuning] Error downloading/uploading PDF {file_name}: {dl_err}")
+
+        # Construct URI for Langfuse
+        storage_account_name = blob_service_client.account_name if blob_service_client else "unknown_account"
+        base_blob_url = f"https://{storage_account_name}.blob.core.windows.net/{container_name}"
 
         # Synchronize logging item to Langfuse
         try:
@@ -73,7 +108,7 @@ def process_finetuning_tabak(payload: dict):
                 input={
                     "record_id": record_id,
                     "file_name": file_name,
-                    "gcs_path": f"gs://{bucket_name}/{destination_path}" if bucket_name else None
+                    "azure_pdf_path": f"{base_blob_url}/{destination_path}" if blob_service_client else None
                 },
                 expected_output=gt_item,
                 metadata={
