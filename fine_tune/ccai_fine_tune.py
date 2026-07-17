@@ -131,9 +131,17 @@ def _process_single_blob(
         # Clip audio per turn and build modified transcript
         for i, current_turn in enumerate(turns):
             role = current_turn["role"]
+            role_normalized = str(role).strip().lower()
             text = current_turn["text"]
             start_time_str = current_turn["timestamp"]
             start_ms = _time_to_ms(start_time_str)
+
+            if role_normalized == "agent":
+                service_type = "stt"
+            elif role_normalized == "customer":
+                service_type = "tts"
+            else:
+                service_type = ""
 
             if i + 1 < len(turns):
                 end_time_str = turns[i + 1]["timestamp"]
@@ -150,7 +158,8 @@ def _process_single_blob(
                 "starting_timestamp": start_time_str,
                 "end_timestamp": end_time_str,
                 "text": text,
-                "clip_name": clip_name
+                "clip_name": clip_name,
+                "service_type": service_type
             })
 
             logging.info(f"[f2 CCAI FineTuning] Clipping {clip_name} ({start_time_str} → {end_time_str})")

@@ -131,10 +131,12 @@ def folder_worker_trigger(timer: func.TimerRequest) -> None:
     if not json_files:
         return
 
+    move_msg_files = os.getenv("MOVE_MSG_FILES_AFTER_PROCESSING", "false").strip().lower() == "true"
     processed_folder = folder / "processed"
     failed_folder = folder / "failed"
-    processed_folder.mkdir(exist_ok=True)
-    failed_folder.mkdir(exist_ok=True)
+    if move_msg_files:
+        processed_folder.mkdir(exist_ok=True)
+        failed_folder.mkdir(exist_ok=True)
 
     for json_file in json_files:
         logging.info(f"[f2 Folder Trigger] Processing file: {json_file.name}")
@@ -150,13 +152,21 @@ def folder_worker_trigger(timer: func.TimerRequest) -> None:
 
             route_fetched_message(payload)
 
-            # Move to processed folder after successful processing
-            json_file.rename(processed_folder / json_file.name)
-            logging.info(f"[f2 Folder Trigger] Done — moved to processed/: {json_file.name}")
+            if move_msg_files:
+                json_file.rename(processed_folder / json_file.name)
+                logging.info(f"[f2 Folder Trigger] Done — moved to processed/: {json_file.name}")
+            else:
+                logging.info(f"[f2 Folder Trigger] Done — retained file in inbox: {json_file.name}")
 
         except json.JSONDecodeError:
             logging.error(f"[f2 Folder Trigger] Invalid JSON in file: {json_file.name}")
-            json_file.rename(failed_folder / json_file.name)
+            if move_msg_files:
+                json_file.rename(failed_folder / json_file.name)
+            else:
+                logging.info(f"[f2 Folder Trigger] Retained invalid JSON in inbox (no move): {json_file.name}")
         except Exception as e:
             logging.error(f"[f2 Folder Trigger] Failed to process {json_file.name}: {e}", exc_info=True)
-            json_file.rename(failed_folder / json_file.name)
+            if move_msg_files:
+                json_file.rename(failed_folder / json_file.name)
+            else:
+                logging.info(f"[f2 Folder Trigger] Retained failed file in inbox (no move): {json_file.name}")

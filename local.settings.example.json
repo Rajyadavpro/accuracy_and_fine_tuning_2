@@ -1,0 +1,41 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "DefaultEndpointsProtocol=https;AccountName=<STORAGE_ACCOUNT_NAME>;AccountKey=<STORAGE_ACCOUNT_KEY>;EndpointSuffix=core.windows.net",
+    
+    "SERVICE_BUS_CONNECTION_STRING": "Endpoint=sb://<SERVICE_BUS_NAMESPACE>.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=<SERVICE_BUS_KEY>=",
+    "SERVICE_BUS_QUEUE_NAME": "ai-accuarcy-and-fine-tuning",
+      
+    "FINAL_DATA_EOB_CONTAINER": "eob-dataset",
+    "FINAL_DATA_SUPERBILL_CONTAINER": "superbill-dataset",
+    "FINAL_DATA_TABAK_CONTAINER": "tabak-dataset",
+    "FINAL_DATA_IDP_CONTAINER": "idp-dataset",
+    "FINAL_DATA_CCAI_CONTAINER": "ccai-dataset",
+    "AZURE_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=<STORAGE_ACCOUNT_NAME>;AccountKey=<STORAGE_ACCOUNT_KEY>;EndpointSuffix=core.windows.net",
+    
+    "SOURCE_DATA_EOB_CONTAINER": "sas-url-data-folder",
+    "SOURCE_DATA_SUPERBILL_CONTAINER": "sas-url-data-folder-prod",
+    
+    "HEALTHCARE_AI_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=<STORAGE_ACCOUNT_NAME>;AccountKey=<STORAGE_ACCOUNT_KEY>;EndpointSuffix=core.windows.net",
+    "CCAI_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=<STORAGE_ACCOUNT_NAME>;AccountKey=<STORAGE_ACCOUNT_KEY>;EndpointSuffix=core.windows.net",
+
+    "HEALTHCARE_AI_DB_JDBC_URL": "jdbc:mysql://<MYSQL_HOST_IP>:<MYSQL_PORT>/<MYSQL_DATABASE>",
+    "HEALTHCARE_AI_DB_SERVER": "<MYSQL_HOST_IP>",
+    "HEALTHCARE_AI_DB_PORT": "3306",
+    "HEALTHCARE_AI_DB_DATABASE": "<MYSQL_DATABASE>",
+    "HEALTHCARE_AI_DB_USERID": "<MYSQL_USERNAME>",
+    "HEALTHCARE_AI_DB_PASSWORD": "<MYSQL_PASSWORD>",
+
+    "CLICKHOUSE_HOST": "<CLICKHOUSE_HOST_IP>",
+    "CLICKHOUSE_HTTP_PORT": "8123",
+    "CLICKHOUSE_DATABASE": "<CLICKHOUSE_DATABASE>",
+    "CLICKHOUSE_USER": "<CLICKHOUSE_USERNAME>",
+    "CLICKHOUSE_PASSWORD": "<CLICKHOUSE_PASSWORD>",
+    
+    "STORAGE_ENVIRONMENT": "dev",
+    "DELETE_MSG_AFTER_PROCESSING": "true",
+    "USE_QUEUE": "True",
+    "MSG_FOLDER_PATH": "msg_inbox"
+  }
+}
