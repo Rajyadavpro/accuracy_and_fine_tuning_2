@@ -58,6 +58,7 @@ def process_finetuning_ccai(payload: dict):
     # 2. Parse payload — payload is the inner body dict
     source_container_name = payload.get("container")
     blob_names = payload.get("blob_names") or []
+    folder_name = str(payload.get("folder_name") or "").strip()
 
     if not source_container_name or not blob_names:
         logging.error("[f2 CCAI FineTuning] Payload missing required fields: 'container' and/or 'blob_names'.")
@@ -72,7 +73,8 @@ def process_finetuning_ccai(payload: dict):
             folder_prefix=folder_prefix,
             ccai_conn_string=ccai_conn_string,
             azure_conn_string=azure_conn_string,
-            target_container_name=target_container_name
+            target_container_name=target_container_name,
+            folder_name=folder_name
         )
 
     logging.info(f"[f2 CCAI FineTuning] All {len(blob_names)} items processed.")
@@ -83,7 +85,8 @@ def _process_single_blob(
     folder_prefix: str,
     ccai_conn_string: str,
     azure_conn_string: str,
-    target_container_name: str
+    target_container_name: str,
+    folder_name: str = ""
 ) -> None:
     """Process a single blob folder (folder_prefix)."""
     logging.info(f"[f2 CCAI FineTuning] Processing folder: {source_container_name}/{folder_prefix}")
@@ -178,8 +181,9 @@ def _process_single_blob(
         ] + [(p, os.path.basename(p)) for p in clipped_files]
 
         logging.info(f"[f2 CCAI FineTuning] Uploading {len(files_to_upload)} files to {target_container_name}/{folder_prefix}/")
+        _upload_prefix = f"{folder_name}/{folder_prefix}" if folder_name else folder_prefix
         for local_path, blob_name in files_to_upload:
-            blob_client = target_container_client.get_blob_client(f"{folder_prefix}/{blob_name}")
+            blob_client = target_container_client.get_blob_client(f"{_upload_prefix}/{blob_name}")
             with open(local_path, "rb") as data:
                 blob_client.upload_blob(data, overwrite=True)
             logging.info(f"[f2 CCAI FineTuning] Uploaded: {folder_prefix}/{blob_name}")

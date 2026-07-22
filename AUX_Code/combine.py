@@ -68,11 +68,13 @@ if __name__ == "__main__":
         ".venv",
         "AUX_code",
         "combine.py",
-        "project_structure.json"  # Ignore the output JSON file itself
+        "project_structure_f2.json",  # Ignore the output JSON file itself,
+        "venv"
+
     ]
     
     # Path where you want to save the final JSON file
-    output_json_path = "project_structure.json"
+    output_json_path = "project_structure_f2.json"
     # ----------------------
 
     if os.path.exists(target_directory):

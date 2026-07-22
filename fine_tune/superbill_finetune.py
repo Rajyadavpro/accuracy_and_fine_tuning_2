@@ -150,6 +150,12 @@ import requests
 # Import Azure Blob Storage libraries
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
+# Langfuse SDK for fetching pipeline traces/prompts
+try:
+    from langfuse import Langfuse
+except ImportError:
+    Langfuse = None
+
 def get_azure_setting(key: str, default=None):
     """
     Helper function to load variables from local.settings.json (local dev)
@@ -168,10 +174,108 @@ def get_azure_setting(key: str, default=None):
     return os.getenv(key, default)
 
 
+def _fetch_prompt_from_langfuse(file_name: str, langfuse_client) -> dict | None:
+    """
+    Searches Medical-Billing-Pipeline traces in Langfuse, matches by
+    metadata["file_name"], then navigates:
+      - Gemini Extraction (GENERATION) → GenerateContent (GENERATION) → input
+      - OR CMS Form Extraction (GENERATION) → input directly
+    Searches only the last 90 days, capped at 5 pages (250 traces).
+    Returns a dict with trace_id, trace_name, file_name, and prompt input,
+    or None if the trace/observation is not found.
+    """
+    import datetime
+    try:
+        from_ts = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=90)
+
+        matched_trace = None
+        MAX_PAGES = 5
+        for page in range(1, MAX_PAGES + 1):
+            result = langfuse_client.fetch_traces(
+                name="Medical-Billing-Pipeline",
+                from_timestamp=from_ts,
+                limit=50,
+                page=page
+            )
+            traces = result.data if result and result.data else []
+            if not traces:
+                break
+            for t in traces:
+                meta = t.metadata or {}
+                if meta.get("file_name") == file_name:
+                    matched_trace = t
+                    break
+            if matched_trace:
+                break
+            if not result.meta or page >= result.meta.total_pages:
+                break
+
+        if not matched_trace:
+            logging.warning(f"[f2 Superbill FineTuning] No Langfuse trace found for file: {file_name}")
+            return None
+
+        # Fetch all observations for the matched trace
+        observations = langfuse_client.fetch_observations(trace_id=matched_trace.id)
+        obs_list = observations.data if observations and observations.data else []
+
+        # Build parent → [children] map
+        children_of: dict = {}
+        for o in obs_list:
+            parent = getattr(o, "parent_observation_id", None)
+            children_of.setdefault(parent, []).append(o)
+
+        prompt_input = None
+
+        # Path 1: Gemini Extraction → GenerateContent → input
+        gemini_extraction = next(
+            (o for o in obs_list if (o.name or "").strip().lower() == "gemini extraction"),
+            None
+        )
+        if gemini_extraction:
+            generate_content = next(
+                (o for o in children_of.get(gemini_extraction.id, [])
+                 if (o.name or "").strip().lower() == "generatecontent"),
+                None
+            )
+            if generate_content:
+                prompt_input = generate_content.input
+            else:
+                logging.warning(
+                    f"[f2 Superbill FineTuning] 'GenerateContent' not found inside "
+                    f"'Gemini Extraction' for trace '{matched_trace.id}'."
+                )
+
+        # Path 2: CMS Form Extraction (GENERATION) → input directly
+        if prompt_input is None:
+            cms_extraction = next(
+                (o for o in obs_list if (o.name or "").strip().lower() == "cms form extraction"),
+                None
+            )
+            if cms_extraction:
+                prompt_input = cms_extraction.input
+
+        if prompt_input is None:
+            logging.warning(
+                f"[f2 Superbill FineTuning] No prompt observation found in trace "
+                f"'{matched_trace.id}' for file '{file_name}'."
+            )
+
+        return {
+            "trace_id": matched_trace.id,
+            "trace_name": matched_trace.name,
+            "file_name": file_name,
+            "prompt": prompt_input,
+        }
+    except Exception as e:
+        logging.warning(f"[f2 Superbill FineTuning] Failed to fetch Langfuse trace for '{file_name}': {e}")
+        return None
+
+
 def process_finetuning_healthcare_superbill(payload: dict):
     logging.info("[f2 Healthcare Superbill FineTuning] Processing payload...")
     environment = payload.get("environment", "exp")
     records = payload.get("records", [])
+    folder_name = str(payload.get("folder_name") or "").strip()
 
     if not records:
         if "allocation_id" in payload:
@@ -213,6 +317,27 @@ def process_finetuning_healthcare_superbill(payload: dict):
     else:
         logging.warning("[f2 Healthcare Superbill FineTuning] Source connection string missing. Fallback downloads from blob will fail.")
 
+    # Initialize Langfuse Client (For fetching pipeline traces/prompts)
+    langfuse_client = None
+    if Langfuse is not None:
+        lf_public_key = get_azure_setting("HEALTHCARE_LANGFUSE_PUBLIC_KEY")
+        lf_secret_key = get_azure_setting("HEALTHCARE_LANGFUSE_SECRET_KEY")
+        lf_host = get_azure_setting("LANGFUSE_HOST", "https://cloud.langfuse.com")
+        if lf_public_key and lf_secret_key:
+            try:
+                langfuse_client = Langfuse(
+                    public_key=lf_public_key,
+                    secret_key=lf_secret_key,
+                    host=lf_host
+                )
+                logging.info("[f2 Healthcare Superbill FineTuning] Langfuse client initialized.")
+            except Exception as lf_err:
+                logging.warning(f"[f2 Healthcare Superbill FineTuning] Failed to initialize Langfuse client: {lf_err}")
+        else:
+            logging.warning("[f2 Healthcare Superbill FineTuning] Langfuse keys missing — prompt fetch will be skipped.")
+    else:
+        logging.warning("[f2 Healthcare Superbill FineTuning] langfuse package not installed — prompt fetch will be skipped.")
+
 
     for rec in records:
         file_name = rec.get("file_name") or "unknown_file.pdf"
@@ -227,11 +352,12 @@ def process_finetuning_healthcare_superbill(payload: dict):
         base_name, _ = os.path.splitext(file_name)
         
         # =================================================================
-        # Folder Structure
-        # Creates a folder named after the file, with both files inside it
+        # Folder Structure: {folder_name}/{base_name}/{base_name}.pdf|json
+        # folder_name comes from the payload; omitted if not set
         # =================================================================
-        pdf_blob_path = f"{base_name}/{base_name}.pdf"
-        json_blob_path = f"{base_name}/{base_name}.json"
+        _prefix = f"{folder_name}/" if folder_name else ""
+        pdf_blob_path = f"{_prefix}{base_name}/{base_name}.pdf"
+        json_blob_path = f"{_prefix}{base_name}/{base_name}.json"
 
         # Read SAS URL directly from ground_truth allocation
         file_url = ground_truth.get("Allocation", {}).get("File_url")
@@ -286,23 +412,44 @@ def process_finetuning_healthcare_superbill(payload: dict):
                     logging.info(f"[f2 Healthcare Superbill FineTuning] Successfully uploaded PDF for allocation {alloc_id}.")
                 except Exception as up_err:
                     logging.error(f"[f2 Healthcare Superbill FineTuning] Error uploading PDF for allocation {alloc_id}: {up_err}")
-            else:
-                logging.error(f"[f2 Healthcare Superbill FineTuning] Could not obtain PDF data for allocation {alloc_id}. Skipping PDF upload.")
 
-            # =================================================================
-            # STEP 4: Upload the JSON Ground Truth
-            # =================================================================
-            try:
-                gt_json_str = json.dumps(ground_truth, indent=2, ensure_ascii=False)
-                blob_client = blob_service_client.get_blob_client(container=container_name, blob=json_blob_path)
-                json_content_settings = ContentSettings(content_type="application/json")
-                blob_client.upload_blob(
-                    gt_json_str, 
-                    overwrite=True, 
-                    content_settings=json_content_settings
-                )
-                logging.info(f"[f2 Healthcare Superbill FineTuning] Successfully uploaded JSON ground truth for allocation {alloc_id}.")
-            except Exception as json_err:
-                logging.error(f"[f2 Healthcare Superbill FineTuning] Failed to upload JSON ground truth: {json_err}")
+                # =============================================================
+                # STEP 4: Upload the JSON Ground Truth
+                # =============================================================
+                try:
+                    gt_json_str = json.dumps(ground_truth, indent=2, ensure_ascii=False)
+                    blob_client = blob_service_client.get_blob_client(container=container_name, blob=json_blob_path)
+                    json_content_settings = ContentSettings(content_type="application/json")
+                    blob_client.upload_blob(
+                        gt_json_str, 
+                        overwrite=True, 
+                        content_settings=json_content_settings
+                    )
+                    logging.info(f"[f2 Healthcare Superbill FineTuning] Successfully uploaded JSON ground truth for allocation {alloc_id}.")
+                except Exception as json_err:
+                    logging.error(f"[f2 Healthcare Superbill FineTuning] Failed to upload JSON ground truth: {json_err}")
+
+                # =============================================================
+                # STEP 5: Fetch Langfuse prompt/trace and upload alongside PDF
+                # Always uploads — empty dict {} if trace/prompt not found
+                # =============================================================
+                if langfuse_client:
+                    prompt_blob_path = f"{_prefix}{base_name}/{base_name}_prompt.json"
+                    prompt_data = _fetch_prompt_from_langfuse(file_name, langfuse_client)
+                    try:
+                        prompt_json_str = json.dumps(prompt_data or {}, indent=2, ensure_ascii=False, default=str)
+                        prompt_blob_client = blob_service_client.get_blob_client(
+                            container=container_name, blob=prompt_blob_path
+                        )
+                        prompt_blob_client.upload_blob(
+                            prompt_json_str,
+                            overwrite=True,
+                            content_settings=ContentSettings(content_type="application/json")
+                        )
+                        logging.info(f"[f2 Healthcare Superbill FineTuning] Uploaded prompt JSON for '{file_name}' at '{prompt_blob_path}'.")
+                    except Exception as prompt_up_err:
+                        logging.error(f"[f2 Healthcare Superbill FineTuning] Failed to upload prompt JSON for allocation {alloc_id}: {prompt_up_err}")
+            else:
+                logging.error(f"[f2 Healthcare Superbill FineTuning] Could not obtain PDF data for allocation {alloc_id}. Skipping.")
 
     logging.info(f"[f2 Healthcare Superbill FineTuning] Superbill fine-tuning batch processing completed.")

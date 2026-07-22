@@ -8,6 +8,7 @@ from fine_tune.gcp_helper import upload_bytes_to_gcs
 def process_finetuning_idp(payload: dict):
     logging.info("[f2 IDP FineTuning] Processing payload...")
     environment = payload.get("environment", "exp")
+    folder_name = str(payload.get("folder_name") or "").strip()
 
     # Configuration for GCS Bucket
     bucket_name = os.getenv("GCP_FINE_TUNING_BUCKET_NAME")
@@ -149,9 +150,10 @@ def process_finetuning_idp(payload: dict):
         client_name = rec["client_name"]
         gt_item = rec["ground_truth"]
 
-        # Format classification path: idp/{prediction}/{filename}
+        # Format classification path: {folder_name}/{prediction}/{filename}
         prediction_clean = str(prediction).strip().replace("/", "_").replace("\\", "_")
-        destination_path = f"idp/{prediction_clean}/{filename}"
+        _prefix = f"{folder_name}/" if folder_name else ""
+        destination_path = f"{_prefix}{prediction_clean}/{filename}"
 
         # Sync PDF file binaries directly to GCS
         if bucket_name:

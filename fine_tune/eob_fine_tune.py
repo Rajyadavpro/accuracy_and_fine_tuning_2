@@ -28,6 +28,7 @@ def process_finetuning_healthcare_eob(payload: dict):
     logging.info("[f2 Healthcare EOB FineTuning] Processing payload...")
     environment = payload.get("environment", "exp")
     records = payload.get("records", [])
+    folder_name = str(payload.get("folder_name") or "").strip()
 
     if not records:
         if "allocation_id" in payload:
@@ -83,11 +84,12 @@ def process_finetuning_healthcare_eob(payload: dict):
         base_name, _ = os.path.splitext(file_name)
         
         # =================================================================
-        # MODIFIED: New Folder Structure
-        # Creates a folder named after the file, with both files inside it
+        # Folder Structure: {folder_name}/{base_name}/{base_name}.pdf|json
+        # folder_name comes from the payload; omitted if not set
         # =================================================================
-        pdf_blob_path = f"{base_name}/{base_name}.pdf"
-        json_blob_path = f"{base_name}/{base_name}.json"
+        _prefix = f"{folder_name}/" if folder_name else ""
+        pdf_blob_path = f"{_prefix}{base_name}/{base_name}.pdf"
+        json_blob_path = f"{_prefix}{base_name}/{base_name}.json"
 
         # Read SAS URL directly from ground_truth allocation
         file_url = ground_truth.get("Allocation", {}).get("File_url")

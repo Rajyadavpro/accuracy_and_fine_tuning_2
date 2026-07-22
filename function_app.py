@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 app = func.FunctionApp()
+USE_QUEUE_MODE = os.getenv("USE_QUEUE", "true").strip().lower() == "true"
 
 
 def route_fetched_message(payload: dict):
@@ -113,60 +114,60 @@ def main_queue_worker_trigger(msg: func.ServiceBusMessage) -> None:
 # Polls MSG_FOLDER_PATH every 10 seconds for JSON files when USE_QUEUE=false
 # =====================================================================
 
-@app.timer_trigger(schedule="*/10 * * * * *", arg_name="timer", run_on_startup=False, use_monitor=False)
-def folder_worker_trigger(timer: func.TimerRequest) -> None:
-    # Only active when USE_QUEUE toggle is off
-    if os.getenv("USE_QUEUE", "true").strip().lower() == "true":
+if not USE_QUEUE_MODE:
+    @app.timer_trigger(schedule="*/10 * * * * *", arg_name="timer", run_on_startup=False, use_monitor=False)
+    def folder_worker_trigger(timer: func.TimerRequest) -> None:
+        folder_path = os.getenv("MSG_FOLDER_PATH", "msg_inbox").strip()
+        folder = Path(folder_path)
+
+        if not folder.exists():
+            folder.mkdir(parents=True, exist_ok=True)
+            logging.info(f"[f2 Folder Trigger] Created inbox folder: {folder.resolve()}")
+            return
+
+        json_files = sorted(folder.glob("*.json"))
+        if not json_files:
+            return
+
+        move_msg_files = os.getenv("MOVE_MSG_FILES_AFTER_PROCESSING", "false").strip().lower() == "true"
+        processed_folder = folder / "processed"
+        failed_folder = folder / "failed"
+        if move_msg_files:
+            processed_folder.mkdir(exist_ok=True)
+            failed_folder.mkdir(exist_ok=True)
+
+        for json_file in json_files:
+            logging.info(f"[f2 Folder Trigger] Processing file: {json_file.name}")
+            try:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                # Accommodate wrapped payloads or raw message JSONs
+                if "body" in data and isinstance(data["body"], dict):
+                    payload = data["body"]
+                else:
+                    payload = data
+
+                route_fetched_message(payload)
+
+                if move_msg_files:
+                    json_file.rename(processed_folder / json_file.name)
+                    logging.info(f"[f2 Folder Trigger] Done — moved to processed/: {json_file.name}")
+                else:
+                    logging.info(f"[f2 Folder Trigger] Done — retained file in inbox: {json_file.name}")
+
+            except json.JSONDecodeError:
+                logging.error(f"[f2 Folder Trigger] Invalid JSON in file: {json_file.name}")
+                if move_msg_files:
+                    json_file.rename(failed_folder / json_file.name)
+                else:
+                    logging.info(f"[f2 Folder Trigger] Retained invalid JSON in inbox (no move): {json_file.name}")
+            except Exception as e:
+                logging.error(f"[f2 Folder Trigger] Failed to process {json_file.name}: {e}", exc_info=True)
+                if move_msg_files:
+                    json_file.rename(failed_folder / json_file.name)
+                else:
+                    logging.info(f"[f2 Folder Trigger] Retained failed file in inbox (no move): {json_file.name}")
+else:
+    def folder_worker_trigger(timer: func.TimerRequest) -> None:
         return
-
-    folder_path = os.getenv("MSG_FOLDER_PATH", "msg_inbox").strip()
-    folder = Path(folder_path)
-
-    if not folder.exists():
-        folder.mkdir(parents=True, exist_ok=True)
-        logging.info(f"[f2 Folder Trigger] Created inbox folder: {folder.resolve()}")
-        return
-
-    json_files = sorted(folder.glob("*.json"))
-    if not json_files:
-        return
-
-    move_msg_files = os.getenv("MOVE_MSG_FILES_AFTER_PROCESSING", "false").strip().lower() == "true"
-    processed_folder = folder / "processed"
-    failed_folder = folder / "failed"
-    if move_msg_files:
-        processed_folder.mkdir(exist_ok=True)
-        failed_folder.mkdir(exist_ok=True)
-
-    for json_file in json_files:
-        logging.info(f"[f2 Folder Trigger] Processing file: {json_file.name}")
-        try:
-            with open(json_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            # Accommodate wrapped payloads or raw message JSONs
-            if "body" in data and isinstance(data["body"], dict):
-                payload = data["body"]
-            else:
-                payload = data
-
-            route_fetched_message(payload)
-
-            if move_msg_files:
-                json_file.rename(processed_folder / json_file.name)
-                logging.info(f"[f2 Folder Trigger] Done — moved to processed/: {json_file.name}")
-            else:
-                logging.info(f"[f2 Folder Trigger] Done — retained file in inbox: {json_file.name}")
-
-        except json.JSONDecodeError:
-            logging.error(f"[f2 Folder Trigger] Invalid JSON in file: {json_file.name}")
-            if move_msg_files:
-                json_file.rename(failed_folder / json_file.name)
-            else:
-                logging.info(f"[f2 Folder Trigger] Retained invalid JSON in inbox (no move): {json_file.name}")
-        except Exception as e:
-            logging.error(f"[f2 Folder Trigger] Failed to process {json_file.name}: {e}", exc_info=True)
-            if move_msg_files:
-                json_file.rename(failed_folder / json_file.name)
-            else:
-                logging.info(f"[f2 Folder Trigger] Retained failed file in inbox (no move): {json_file.name}")
