@@ -31,8 +31,8 @@ def route_fetched_message(payload: dict):
             from accuracy.idp_accuracy import process_accuracy_idp
             process_accuracy_idp(payload)
         elif src_normalized == "tabak":
-            from accuracy.tabak_accuracy import process_accuracy_tabak
-            process_accuracy_tabak(payload)
+            from accuracy.tabak_accuracy import process_tabak_transaction_metrics
+            process_tabak_transaction_metrics(payload)
         elif src_normalized in ("healthcare_eob", "healthcare_accuracy_eob", "eob"):
             from accuracy.healthcare_accuracy import process_accuracy_healthcare_eob
             process_accuracy_healthcare_eob(payload)

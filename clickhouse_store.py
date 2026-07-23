@@ -48,6 +48,43 @@ EOB_FINETUNING_CHECKPOINT_TABLE = "eob_finetuning_checkpoint"
 SUPERBILL_FINETUNING_CHECKPOINT_TABLE = "superbill_finetuning_checkpoint"
 AUDIO_FINETUNING_CHECKPOINT_TABLE = "audio_finetuning_checkpoint"
 
+def ensure_tabak_transaction_metrics_table(timeout: int = 15) -> bool:
+    """Create a single, consolidated Tabak metrics table if it doesn't exist."""
+    host, http_port, database, user, password = _client_config()
+    
+    # Ensure database exists first
+    _http_exec(f"CREATE DATABASE IF NOT EXISTS `{database}`", timeout=timeout)
+    
+    # DDL for the consolidated table
+    ddl = f"""
+        CREATE TABLE IF NOT EXISTS `{database}`.`tabak_transaction_metrics` (
+            environment String,
+            transaction_id String,
+            file_name String,
+            gen_cat String,
+            gen_subcat String,
+            user_cat String,
+            user_sub_cat String,
+            category String,
+            sub_category String,
+            is_cat_correct UInt8,
+            is_sub_cstcorrect UInt8,
+            input_token UInt64,
+            output_token UInt64,
+            cost Float64,
+            latency Float64,
+            inserted_at DateTime DEFAULT now()
+        ) ENGINE = ReplacingMergeTree(inserted_at)
+        ORDER BY (environment, transaction_id)
+    """
+    
+    if _http_exec(ddl, timeout=timeout):
+        logger.info("[ClickHouse] Consolidated Tabak transaction metrics table is ready.")
+        return True
+    else:
+        logger.error("[ClickHouse] Failed to create consolidated Tabak transaction metrics table.")
+        return False
+
 
 def _env(name: str, default: str = "") -> str:
     value = os.getenv(name)
@@ -435,10 +472,22 @@ def _ensure_healthcare_accuracy_table_http(table_name: str, timeout: int = 15) -
             total_matched UInt64,
             total_mismatches UInt64,
             accuracy Float64,
+            input_token UInt64,
+            output_token UInt64,
+            cost Float64,
+            latency Float64,
             created_at DateTime DEFAULT now()
         ) ENGINE = ReplacingMergeTree(created_at)
         ORDER BY (environment, allocation_id, item_id)
     """, timeout=timeout)
+    # Add columns to existing tables that were created before these columns existed
+    for col_ddl in [
+        f"ALTER TABLE `{database}`.`{table_name}` ADD COLUMN IF NOT EXISTS input_token UInt64 DEFAULT 0",
+        f"ALTER TABLE `{database}`.`{table_name}` ADD COLUMN IF NOT EXISTS output_token UInt64 DEFAULT 0",
+        f"ALTER TABLE `{database}`.`{table_name}` ADD COLUMN IF NOT EXISTS cost Float64 DEFAULT 0.0",
+        f"ALTER TABLE `{database}`.`{table_name}` ADD COLUMN IF NOT EXISTS latency Float64 DEFAULT 0.0",
+    ]:
+        _http_exec(col_ddl, timeout=timeout)
 
 
 def get_healthcare_dataset_state(table_name: str, environment: str) -> tuple:
@@ -491,12 +540,15 @@ def insert_healthcare_accuracy_rows(table_name: str, environment: str, rows: lis
             f"('{env_esc}','{_esc(row['item_id'])}','{_esc(row['source_type'])}',"
             f"{int(row['allocation_id'])},'{_date_str(row.get('date'))}','{_dt_str(row.get('date_time'))}',"
             f"'{_esc(row.get('file_name'))}','{_esc(row.get('client_name'))}',"
-            f"{int(row.get('total_matched') or 0)},{int(row.get('total_mismatches') or 0)},{float(row.get('accuracy') or 0.0)})"
+            f"{int(row.get('total_matched') or 0)},{int(row.get('total_mismatches') or 0)},{float(row.get('accuracy') or 0.0)},"
+            f"{int(row.get('input_token') or 0)},{int(row.get('output_token') or 0)},"
+            f"{float(row.get('cost') or 0.0)},{float(row.get('latency') or 0.0)})"
         )
     insert_sql = (
         f"INSERT INTO `{database}`.`{table_name}` "
         f"(environment,item_id,source_type,allocation_id,source_date,date_time,"
-        f"file_name,client_name,total_matched,total_mismatches,accuracy) "
+        f"file_name,client_name,total_matched,total_mismatches,accuracy,"
+        f"input_token,output_token,cost,latency) "
         f"VALUES {','.join(values)}"
     )
     resp = requests.post(url, auth=(user, password), data=insert_sql.encode(), timeout=60)

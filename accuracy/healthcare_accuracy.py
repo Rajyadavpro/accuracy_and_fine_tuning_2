@@ -7,8 +7,9 @@ import threading
 import datetime as dt
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, Sequence, Optional
+from typing import Any, Sequence, Optional, Dict
 from dataclasses import dataclass
+from langfuse import Langfuse
 
 # Attempt importing clickhouse_store directly, falling back to parent folder injection if needed
 try:
@@ -773,6 +774,134 @@ def audit_superbill_allocation(
 
 
 # ---------------------------------------------------------------------------
+# Langfuse Helpers
+# ---------------------------------------------------------------------------
+
+def get_azure_setting(key: str, default=None):
+    """Reads from local.settings.json Values first, then falls back to env vars."""
+    try:
+        if os.path.exists("local.settings.json"):
+            with open("local.settings.json", "r") as f:
+                settings = json.load(f)
+                if "Values" in settings and key in settings["Values"]:
+                    return settings["Values"][key]
+    except Exception as e:
+        logging.warning(f"Could not read local.settings.json: {e}")
+    return os.getenv(key, default)
+
+
+def _parse_date_from_filename(file_name: str) -> dt.date | None:
+    """Extracts YYYYMMDD date embedded in filenames like *_20260619112812_*.pdf"""
+    m = re.search(r"(\d{8})\d{6}", file_name)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y%m%d").date()
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_superbill_date_from_filename(file_name: str) -> dt.date | None:
+    """
+    Extracts date from superbill filenames which use MMDDYYYY format
+    e.g. 'Jennifer Soyama 04202026 - Coded anitha 04212026.pdf' -> 2026-04-20
+    Tries MMDDYYYY first, then YYYYMMDD as fallback.
+    """
+    # Find all standalone 8-digit groups
+    for m in re.finditer(r"\b(\d{8})\b", file_name):
+        token = m.group(1)
+        # Try MMDDYYYY (superbill convention)
+        try:
+            return datetime.strptime(token, "%m%d%Y").date()
+        except ValueError:
+            pass
+        # Try YYYYMMDD (tabak convention)
+        try:
+            return datetime.strptime(token, "%Y%m%d").date()
+        except ValueError:
+            pass
+    return None
+
+
+def fetch_superbill_langfuse_metrics(file_name: str, langfuse_client: Langfuse) -> Dict[str, Any]:
+    """
+    Searches Medical-Billing-Pipeline traces matching the file_name in Langfuse
+    to retrieve token counts, total cost, and latency.
+    Narrows the search window using the date embedded in the filename.
+    Token counts come from child observations since trace.usage may be None.
+    """
+    metrics = {"input_token": 0, "output_token": 0, "cost": 0.0, "latency": 0.0}
+
+    if not langfuse_client or not file_name:
+        return metrics
+
+    try:
+        file_date = _parse_superbill_date_from_filename(file_name)
+        if file_date:
+            from_ts = datetime(file_date.year, file_date.month, file_date.day,
+                               tzinfo=dt.timezone.utc)
+            to_ts = from_ts + dt.timedelta(days=4)
+        else:
+            from_ts = datetime.now(dt.timezone.utc) - dt.timedelta(days=90)
+            to_ts = None
+
+        matched_trace_id = None
+        page = 1
+        while page <= 10 and matched_trace_id is None:
+            fetch_kwargs = dict(name="Medical-Billing-Pipeline", from_timestamp=from_ts, limit=100, page=page)
+            if to_ts:
+                fetch_kwargs["to_timestamp"] = to_ts
+
+            result = langfuse_client.fetch_traces(**fetch_kwargs)
+            traces = result.data if result and result.data else []
+            if not traces:
+                break
+
+            for t in traces:
+                inp = t.input or {}
+                try:
+                    args = inp.get("args") or []
+                    first_arg = args[0] if args else {}
+                    # Superbill traces use args[0].name; also try filename/file_name
+                    trace_file = (
+                        first_arg.get("name")
+                        or first_arg.get("filename")
+                        or first_arg.get("file_name")
+                        or inp.get("filename")
+                        or inp.get("file_name")
+                    )
+                except Exception:
+                    trace_file = None
+
+                if trace_file and trace_file == file_name:
+                    metrics["cost"] = float(getattr(t, "total_cost", 0.0) or 0.0)
+                    metrics["latency"] = float(getattr(t, "latency", 0.0) or 0.0)
+                    matched_trace_id = t.id
+                    break
+
+            if len(traces) < 100:
+                break
+            page += 1
+
+        # Trace.usage is None — get tokens from child observations
+        if matched_trace_id:
+            try:
+                obs_result = langfuse_client.fetch_observations(trace_id=matched_trace_id, limit=50)
+                for obs in (obs_result.data or []):
+                    usage = getattr(obs, "usage", None)
+                    if usage:
+                        metrics["input_token"] += int(getattr(usage, "input", 0) or 0)
+                        metrics["output_token"] += int(getattr(usage, "output", 0) or 0)
+            except Exception as e:
+                logging.warning(f"Failed to fetch observations for trace {matched_trace_id}: {e}")
+
+    except Exception as e:
+        logging.warning(f"Failed to fetch Langfuse metrics for '{file_name}': {e}")
+
+    return metrics
+
+
+# ---------------------------------------------------------------------------
 # Core Entry Point Processors
 # ---------------------------------------------------------------------------
 
@@ -900,6 +1029,11 @@ def process_accuracy_healthcare_superbill(payload: dict):
         logging.error(f"[f2 Healthcare Superbill Accuracy] Database connection failed: {e}", exc_info=True)
         return
 
+    # -----------------------------------------------------------------------
+    # All DB work (fetch + audit) inside a single connection block to avoid
+    # InterfaceError caused by using conn after the transaction context exits
+    # -----------------------------------------------------------------------
+    audit_results = []
     try:
         with conn:
             tables = {
@@ -917,41 +1051,73 @@ def process_accuracy_healthcare_superbill(payload: dict):
             with conn.cursor() as cursor:
                 cursor.execute(query, tuple(record_ids))
                 rows = cursor.fetchall()
+
+            logging.info(f"[f2 Healthcare Superbill Accuracy] Fetched {len(rows)} matching allocations.")
+
+            for row in rows:
+                alloc_id = str(row.get("Id"))
+                file_name = row.get("File_name") or row.get("file_name") or ""
+
+                stats = CompareStats()
+                _SB_ACTIVE_STATS.value = stats
+                try:
+                    mismatches, stats = audit_superbill_allocation(row, conn, tables)
+                except Exception as aud_ex:
+                    logging.error(f"[f2 Healthcare Superbill Accuracy] Audit failed for Superbill ID {alloc_id}: {aud_ex}", exc_info=True)
+                    _SB_ACTIVE_STATS.value = None
+                    continue
+                finally:
+                    _SB_ACTIVE_STATS.value = None
+
+                total_compared = stats.matches + stats.mismatches
+                accuracy_pct = (stats.matches / total_compared * 100.0) if total_compared else 0.0
+
+                audit_results.append({
+                    "alloc_id": alloc_id,
+                    "file_name": file_name,
+                    "date": _extract_date_string(row.get("Download_Date") or row.get("download_date")),
+                    "date_time": _to_iso_datetime_string(row.get("UpdatedAt") or row.get("UpdatedOn") or row.get("CreatedOn")),
+                    "client_name": row.get("Client") or row.get("client_name") or "",
+                    "total_matched": stats.matches,
+                    "total_mismatches": stats.mismatches,
+                    "accuracy": round(accuracy_pct, 4),
+                })
     except Exception as e:
-        logging.error(f"[f2 Healthcare Superbill Accuracy] Query execution failed: {e}", exc_info=True)
+        logging.error(f"[f2 Healthcare Superbill Accuracy] DB operation failed: {e}", exc_info=True)
         return
 
-    logging.info(f"[f2 Healthcare Superbill Accuracy] Fetched {len(rows)} matching allocations.")
+    logging.info(f"[f2 Healthcare Superbill Accuracy] Audited {len(audit_results)} allocations.")
+
+    # Initialize Langfuse AFTER DB connection is released
+    langfuse_client = None
+    lf_public_key = get_azure_setting("HEALTHCARE_LANGFUSE_PUBLIC_KEY")
+    lf_secret_key = get_azure_setting("HEALTHCARE_LANGFUSE_SECRET_KEY")
+    lf_host = get_azure_setting("LANGFUSE_HOST", "https://cloud.langfuse.com")
+    if lf_public_key and lf_secret_key:
+        try:
+            langfuse_client = Langfuse(public_key=lf_public_key, secret_key=lf_secret_key, host=lf_host)
+            logging.info("[f2 Healthcare Superbill Accuracy] Langfuse client initialized.")
+        except Exception as lf_err:
+            logging.warning(f"[f2 Healthcare Superbill Accuracy] Langfuse init failed: {lf_err}")
 
     clickhouse_rows = []
-    for row in rows:
-        alloc_id = str(row.get("Id"))
-        
-        stats = CompareStats()
-        _SB_ACTIVE_STATS.value = stats
-
-        try:
-            mismatches, stats = audit_superbill_allocation(row, conn, tables)
-        except Exception as aud_ex:
-            logging.error(f"[f2 Healthcare Superbill Accuracy] Audit failed for Superbill ID {alloc_id}: {aud_ex}", exc_info=True)
-            continue
-        finally:
-            _SB_ACTIVE_STATS.value = None
-
-        total_compared = stats.matches + stats.mismatches
-        accuracy_pct = (stats.matches / total_compared * 100.0) if total_compared else 0.0
-
+    for result in audit_results:
+        lf_metrics = fetch_superbill_langfuse_metrics(result["file_name"], langfuse_client)
         clickhouse_rows.append({
-            "item_id": f"Superbill::{alloc_id}",
+            "item_id": f"Superbill::{result['alloc_id']}",
             "source_type": "Superbill",
-            "allocation_id": alloc_id,
-            "date": _extract_date_string(row.get("Download_Date") or row.get("download_date")),
-            "date_time": _to_iso_datetime_string(row.get("UpdatedAt") or row.get("UpdatedOn") or row.get("CreatedOn")),
-            "file_name": row.get("File_name") or row.get("file_name") or "",
-            "client_name": row.get("Client") or row.get("client_name") or "",
-            "total_matched": stats.matches,
-            "total_mismatches": stats.mismatches,
-            "accuracy": round(accuracy_pct, 4)
+            "allocation_id": result["alloc_id"],
+            "date": result["date"],
+            "date_time": result["date_time"],
+            "file_name": result["file_name"],
+            "client_name": result["client_name"],
+            "total_matched": result["total_matched"],
+            "total_mismatches": result["total_mismatches"],
+            "accuracy": result["accuracy"],
+            "input_token": lf_metrics["input_token"],
+            "output_token": lf_metrics["output_token"],
+            "cost": lf_metrics["cost"],
+            "latency": lf_metrics["latency"],
         })
 
     if clickhouse_rows:
