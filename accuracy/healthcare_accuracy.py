@@ -10,6 +10,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Sequence, Optional, Dict
 from dataclasses import dataclass
 from langfuse import Langfuse
+try:
+    import httpx as _httpx
+except ImportError:
+    _httpx = None
 
 # Attempt importing clickhouse_store directly, falling back to parent folder injection if needed
 try:
@@ -806,9 +810,12 @@ def _parse_superbill_date_from_filename(file_name: str) -> dt.date | None:
     Extracts date from superbill filenames which use MMDDYYYY format
     e.g. 'Jennifer Soyama 04202026 - Coded anitha 04212026.pdf' -> 2026-04-20
     Tries MMDDYYYY first, then YYYYMMDD as fallback.
+    Also handles filenames where the date is embedded at the start of a longer
+    digit sequence, e.g. '20260702065403746939' -> 2026-07-02.
     """
-    # Find all standalone 8-digit groups
-    for m in re.finditer(r"\b(\d{8})\b", file_name):
+    # Match 8 digits not preceded by another digit (handles both standalone and
+    # prefix-of-longer-sequence cases, e.g. 20260702 inside 20260702065403...)
+    for m in re.finditer(r"(?<!\d)(\d{8})", file_name):
         token = m.group(1)
         # Try MMDDYYYY (superbill convention)
         try:
@@ -854,6 +861,7 @@ def fetch_superbill_langfuse_metrics(file_name: str, langfuse_client: Langfuse) 
 
             result = langfuse_client.fetch_traces(**fetch_kwargs)
             traces = result.data if result and result.data else []
+            logging.info(f"[Langfuse] page={page} traces_returned={len(traces)} for file='{file_name}' window=[{from_ts}, {to_ts}]")
             if not traces:
                 break
 
@@ -872,6 +880,10 @@ def fetch_superbill_langfuse_metrics(file_name: str, langfuse_client: Langfuse) 
                     )
                 except Exception:
                     trace_file = None
+
+                if page == 1 and traces.index(t) == 0:
+                    # Log the first trace's name and input structure to diagnose mismatches
+                    logging.info(f"[Langfuse] First trace: id={t.id}, name={getattr(t, 'name', None)!r}, input_keys={list(inp.keys()) if isinstance(inp, dict) else type(inp).__name__}, trace_file={trace_file!r}")
 
                 if trace_file and trace_file == file_name:
                     metrics["cost"] = float(getattr(t, "total_cost", 0.0) or 0.0)
@@ -896,6 +908,11 @@ def fetch_superbill_langfuse_metrics(file_name: str, langfuse_client: Langfuse) 
                 logging.warning(f"Failed to fetch observations for trace {matched_trace_id}: {e}")
 
     except Exception as e:
+        # Re-raise network/timeout errors so the caller can short-circuit remaining files.
+        # All other errors are swallowed and 0s are returned.
+        _err_lower = str(e).lower()
+        if "timed out" in _err_lower or "connection" in _err_lower or "network" in _err_lower:
+            raise
         logging.warning(f"Failed to fetch Langfuse metrics for '{file_name}': {e}")
 
     return metrics
@@ -935,6 +952,13 @@ def process_accuracy_healthcare_eob(payload: dict):
         logging.error(f"[f2 Healthcare EOB Accuracy] Database connection failed: {e}", exc_info=True)
         return
 
+    # -----------------------------------------------------------------------
+    # All DB work (fetch + audit) inside a single connection block to avoid
+    # InterfaceError caused by using conn after the transaction context exits.
+    # audit_eob_allocation calls fetch_rows_by_fk/fetch_row_by_id which need
+    # an open connection — they must run before conn closes.
+    # -----------------------------------------------------------------------
+    clickhouse_rows = []
     try:
         with conn:
             tables = {
@@ -953,43 +977,44 @@ def process_accuracy_healthcare_eob(payload: dict):
             with conn.cursor() as cursor:
                 cursor.execute(query, tuple(record_ids))
                 rows = cursor.fetchall()
+
+            logging.info(f"[f2 Healthcare EOB Accuracy] Fetched {len(rows)} matching allocations.")
+
+            for row in rows:
+                alloc_id = str(row.get("Id"))
+
+                global _EOB_ACTIVE_STATS
+                _EOB_ACTIVE_STATS = CompareStats()
+
+                try:
+                    mismatches = audit_eob_allocation(row, conn, tables)
+                    stats = _EOB_ACTIVE_STATS or CompareStats()
+                except Exception as aud_ex:
+                    logging.error(f"[f2 Healthcare EOB Accuracy] Audit failed for EOB ID {alloc_id}: {aud_ex}", exc_info=True)
+                    continue
+                finally:
+                    _EOB_ACTIVE_STATS = None
+
+                total_compared = stats.matches + len(mismatches)
+                accuracy_pct = (stats.matches / total_compared * 100.0) if total_compared else 0.0
+
+                clickhouse_rows.append({
+                    "item_id": f"EOB::{alloc_id}",
+                    "source_type": "EOB",
+                    "allocation_id": alloc_id,
+                    "date": _extract_date_string(row.get("Download_Date") or row.get("download_date")),
+                    "date_time": _to_iso_datetime_string(row.get("UpdatedAt") or row.get("UpdatedOn") or row.get("CreatedOn")),
+                    "file_name": row.get("File_name") or row.get("file_name") or "",
+                    "client_name": row.get("Client") or row.get("client_name") or "",
+                    "total_matched": stats.matches,
+                    "total_mismatches": len(mismatches),
+                    "accuracy": round(accuracy_pct, 4)
+                })
     except Exception as e:
-        logging.error(f"[f2 Healthcare EOB Accuracy] Query execution failed: {e}", exc_info=True)
+        logging.error(f"[f2 Healthcare EOB Accuracy] DB operation failed: {e}", exc_info=True)
         return
 
-    logging.info(f"[f2 Healthcare EOB Accuracy] Fetched {len(rows)} matching allocations.")
-
-    clickhouse_rows = []
-    for row in rows:
-        alloc_id = str(row.get("Id"))
-        
-        global _EOB_ACTIVE_STATS
-        _EOB_ACTIVE_STATS = CompareStats()
-
-        try:
-            mismatches = audit_eob_allocation(row, conn, tables)
-            stats = _EOB_ACTIVE_STATS or CompareStats()
-        except Exception as aud_ex:
-            logging.error(f"[f2 Healthcare EOB Accuracy] Audit failed for EOB ID {alloc_id}: {aud_ex}", exc_info=True)
-            continue
-        finally:
-            _EOB_ACTIVE_STATS = None
-
-        total_compared = stats.matches + len(mismatches)
-        accuracy_pct = (stats.matches / total_compared * 100.0) if total_compared else 0.0
-
-        clickhouse_rows.append({
-            "item_id": f"EOB::{alloc_id}",
-            "source_type": "EOB",
-            "allocation_id": alloc_id,
-            "date": _extract_date_string(row.get("Download_Date") or row.get("download_date")),
-            "date_time": _to_iso_datetime_string(row.get("UpdatedAt") or row.get("UpdatedOn") or row.get("CreatedOn")),
-            "file_name": row.get("File_name") or row.get("file_name") or "",
-            "client_name": row.get("Client") or row.get("client_name") or "",
-            "total_matched": stats.matches,
-            "total_mismatches": len(mismatches),
-            "accuracy": round(accuracy_pct, 4)
-        })
+    logging.info(f"[f2 Healthcare EOB Accuracy] Audited {len(clickhouse_rows)} allocations.")
 
     if clickhouse_rows:
         try:
@@ -1095,15 +1120,64 @@ def process_accuracy_healthcare_superbill(payload: dict):
     lf_host = get_azure_setting("LANGFUSE_HOST", "https://cloud.langfuse.com")
     if lf_public_key and lf_secret_key:
         try:
-            langfuse_client = Langfuse(public_key=lf_public_key, secret_key=lf_secret_key, host=lf_host)
-            logging.info("[f2 Healthcare Superbill Accuracy] Langfuse client initialized.")
+            _lf_kwargs = {}
+            if _httpx is not None:
+                _lf_kwargs["httpx_client"] = _httpx.Client(
+                    timeout=_httpx.Timeout(connect=5.0, read=8.0, write=10.0, pool=5.0)
+                )
+            langfuse_client = Langfuse(public_key=lf_public_key, secret_key=lf_secret_key, host=lf_host, **_lf_kwargs)
+            logging.info("[f2 Healthcare Superbill Accuracy] Langfuse client initialized (read timeout=8s).")
         except Exception as lf_err:
             logging.warning(f"[f2 Healthcare Superbill Accuracy] Langfuse init failed: {lf_err}")
 
+    # Build ClickHouse rows from audit results first, using zeros for Langfuse fields.
+    # Langfuse metrics are enriched below only when available — they must not block the insert.
     clickhouse_rows = []
     for result in audit_results:
-        lf_metrics = fetch_superbill_langfuse_metrics(result["file_name"], langfuse_client)
         clickhouse_rows.append({
+            "item_id": f"Superbill::{result['alloc_id']}",
+            "source_type": "Superbill",
+            "allocation_id": result["alloc_id"],
+            "date": result["date"],
+            "date_time": result["date_time"],
+            "file_name": result["file_name"],
+            "client_name": result["client_name"],
+            "total_matched": result["total_matched"],
+            "total_mismatches": result["total_mismatches"],
+            "accuracy": result["accuracy"],
+            "input_token": 0,
+            "output_token": 0,
+            "cost": 0.0,
+            "latency": 0.0,
+        })
+
+    # Persist accuracy data to ClickHouse immediately — independent of Langfuse.
+    if clickhouse_rows:
+        try:
+            inserted = insert_healthcare_accuracy_rows(HEALTHCARE_SUPERBILL_ACCURACY_TABLE, environment, clickhouse_rows)
+            logging.info(f"[f2 Healthcare Superbill Accuracy] Successfully stored {inserted} evaluation summaries in ClickHouse.")
+        except Exception as ch_err:
+            logging.error(f"[f2 Healthcare Superbill Accuracy] Failed to insert summaries into ClickHouse: {ch_err}", exc_info=True)
+
+    # Enrich with Langfuse metrics (best-effort).
+    # If Langfuse is unreachable (timeout/connection error on first call), the loop is
+    # immediately abandoned and the 0s already saved to ClickHouse are kept as-is.
+    lf_enriched = []
+    lf_unreachable = False
+    for result in audit_results:
+        if lf_unreachable:
+            continue
+        try:
+            lf_metrics = fetch_superbill_langfuse_metrics(result["file_name"], langfuse_client)
+        except Exception:
+            lf_unreachable = True
+            logging.warning(
+                "[f2 Healthcare Superbill Accuracy] Langfuse unreachable — "
+                "skipping enrichment for all remaining files, 0s are kept for token/cost/latency."
+            )
+            continue
+        if lf_metrics["input_token"] or lf_metrics["output_token"] or lf_metrics["cost"] or lf_metrics["latency"]:
+            lf_enriched.append({
             "item_id": f"Superbill::{result['alloc_id']}",
             "source_type": "Superbill",
             "allocation_id": result["alloc_id"],
@@ -1120,9 +1194,9 @@ def process_accuracy_healthcare_superbill(payload: dict):
             "latency": lf_metrics["latency"],
         })
 
-    if clickhouse_rows:
+    if lf_enriched:
         try:
-            inserted = insert_healthcare_accuracy_rows(HEALTHCARE_SUPERBILL_ACCURACY_TABLE, environment, clickhouse_rows)
-            logging.info(f"[f2 Healthcare Superbill Accuracy] Successfully stored {inserted} evaluation summaries in ClickHouse.")
+            insert_healthcare_accuracy_rows(HEALTHCARE_SUPERBILL_ACCURACY_TABLE, environment, lf_enriched)
+            logging.info(f"[f2 Healthcare Superbill Accuracy] Updated {len(lf_enriched)} rows with Langfuse metrics in ClickHouse.")
         except Exception as ch_err:
-            logging.error(f"[f2 Healthcare Superbill Accuracy] Failed to insert summaries into ClickHouse: {ch_err}", exc_info=True)
+            logging.error(f"[f2 Healthcare Superbill Accuracy] Failed to update Langfuse metrics in ClickHouse: {ch_err}", exc_info=True)

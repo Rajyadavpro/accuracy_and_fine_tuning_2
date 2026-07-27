@@ -75,7 +75,7 @@ def route_fetched_message(payload: dict):
     queue_name="%SERVICE_BUS_QUEUE_NAME%",
     connection="SERVICE_BUS_CONNECTION_STRING",
     is_sessions_enabled=False,
-    auto_complete=False
+    auto_complete=True
 )
 def main_queue_worker_trigger(msg: func.ServiceBusMessage) -> None:
     # If USE_QUEUE toggle is off, skip processing from queue
@@ -84,7 +84,6 @@ def main_queue_worker_trigger(msg: func.ServiceBusMessage) -> None:
         return
 
     logging.info("f2 Queue Trigger activated. Parsing message payload...")
-    delete_after_processing = os.getenv("DELETE_MSG_AFTER_PROCESSING", "true").strip().lower() == "true"
     try:
         body_str = msg.get_body().decode('utf-8')
         data = json.loads(body_str)
@@ -96,10 +95,7 @@ def main_queue_worker_trigger(msg: func.ServiceBusMessage) -> None:
             payload = data
 
         route_fetched_message(payload)
-        if delete_after_processing:
-            logging.info("f2 Queue Trigger: Processing succeeded. Runtime will auto-complete message.")
-        else:
-            logging.info("f2 Queue Trigger: DELETE_MSG_AFTER_PROCESSING=false is not supported with this trigger type; runtime auto-complete remains active.")
+        logging.info("f2 Queue Trigger: Processing succeeded — runtime will complete (delete) the message.")
 
     except json.JSONDecodeError:
         logging.error("f2 Trigger failed: Message content was not valid JSON.")

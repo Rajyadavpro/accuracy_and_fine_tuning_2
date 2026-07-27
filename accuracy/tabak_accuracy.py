@@ -4,6 +4,7 @@ import logging
 import datetime
 import pymysql
 import requests
+import httpx
 from typing import List, Dict, Any
 from langfuse import Langfuse
 
@@ -75,7 +76,7 @@ def _parse_date_from_filename(file_name: str) -> datetime.date | None:
     return None
 
 
-def fetch_langfuse_metrics(file_name: str, langfuse_client: Langfuse) -> Dict[str, Any]:
+def fetch_langfuse_metrics(file_name: str, langfuse_client: Langfuse, timeout: int = 15) -> Dict[str, Any]:
     """
     Searches tabak-classificationEngine traces matching the file name in Langfuse
     to retrieve token counts, total cost, and latency.
@@ -223,6 +224,9 @@ def process_tabak_transaction_metrics(payload: dict):
         logging.error("[f2 Tabak] Missing MariaDB database credentials. Check environment variables.")
         return
 
+    db_connect_timeout = int(get_azure_setting("TABAK_DB_CONNECT_TIMEOUT", "10"))
+    db_read_timeout = int(get_azure_setting("TABAK_DB_READ_TIMEOUT", "30"))
+
     # Connect to MariaDB[cite: 2]
     try:
         conn = pymysql.connect(
@@ -232,11 +236,13 @@ def process_tabak_transaction_metrics(payload: dict):
             password=password,
             database=database,
             cursorclass=pymysql.cursors.DictCursor,
-            connect_timeout=10,
+            connect_timeout=db_connect_timeout,
+            read_timeout=db_read_timeout,
+            write_timeout=db_read_timeout,
             charset="utf8mb4"
         )
     except Exception as e:
-        logging.error(f"[f2 Tabak] Database connection failed: {e}", exc_info=True)
+        logging.error(f"[f2 Tabak] Database connection failed: {e}")
         return
 
     # Fetch rows from MariaDB[cite: 2]
@@ -263,9 +269,23 @@ def process_tabak_transaction_metrics(payload: dict):
     lf_secret_key = get_azure_setting("TABAK_LANGFUSE_SECRET_KEY")
     lf_host = get_azure_setting("LANGFUSE_HOST", "https://cloud.langfuse.com")
 
+    lf_timeout = int(get_azure_setting("LANGFUSE_TIMEOUT_SECONDS", "15"))
     if lf_public_key and lf_secret_key:
         try:
-            langfuse_client = Langfuse(public_key=lf_public_key, secret_key=lf_secret_key, host=lf_host)
+            _httpx_timeout = httpx.Timeout(
+                connect=lf_timeout,
+                read=lf_timeout,
+                write=lf_timeout,
+                pool=lf_timeout,
+            )
+            langfuse_client = Langfuse(
+                public_key=lf_public_key,
+                secret_key=lf_secret_key,
+                host=lf_host,
+                timeout=lf_timeout,
+                max_retries=1,
+                httpx_client=httpx.Client(timeout=_httpx_timeout),
+            )
             logging.info("[f2 Tabak] Langfuse client initialized[cite: 3].")
         except Exception as lf_err:
             logging.warning(f"[f2 Tabak] Langfuse initialization failed: {lf_err}[cite: 3].")
@@ -320,7 +340,7 @@ def process_tabak_transaction_metrics(payload: dict):
         is_sub_cstcorrect = 1 if (not user_sub_cat or normalize_compare(user_sub_cat, gen_subcat)) else 0
 
         # Fetch traces/metrics from Langfuse using the extracted file name[cite: 3]
-        lf_metrics = fetch_langfuse_metrics(file_name, langfuse_client)
+        lf_metrics = fetch_langfuse_metrics(file_name, langfuse_client, timeout=lf_timeout)
 
         clickhouse_rows.append({
             "transaction_id": t_id,
